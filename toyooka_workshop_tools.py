@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import requests
 from branca.colormap import linear
+from folium.plugins import TimestampedGeoJson
 from IPython.display import display
 from shapely.geometry import LineString
 
@@ -96,6 +97,8 @@ def load_workshop(
     )
 
     population_dir = data_dir / "population"
+    if population_dir.exists():
+        shutil.rmtree(population_dir)
     population_dir.mkdir(exist_ok=True)
     with zipfile.ZipFile(population_zip) as zf:
         zf.extractall(population_dir)
@@ -103,6 +106,24 @@ def load_workshop(
     gtfs = _read_gtfs(gtfs_zip)
     population_file = next(population_dir.glob("*.geojson"))
     population = gpd.read_file(population_file)
+    required_population_columns = {
+        "pop_2020",
+        "pop_2025",
+        "pop_2040",
+        "age65p_2025",
+        "age65p_2040",
+    }
+    missing_population_columns = required_population_columns - set(population.columns)
+    if missing_population_columns:
+        if "PTN_2020" in population.columns:
+            raise ValueError(
+                "兵庫県全域の原データではなく、講習用に加工した "
+                "toyooka_population_250m_r6_workshop.geojson.zip を指定してください。"
+            )
+        raise ValueError(
+            "人口データに必要な列がありません："
+            + "、".join(sorted(missing_population_columns))
+        )
 
     stops = gtfs["stops"]
     stops["stop_lat"] = pd.to_numeric(stops["stop_lat"])
@@ -324,6 +345,182 @@ def show_service_timeline(service: ServiceResult) -> None:
     plt.show()
 
 
+def _route_id_from_name(service: ServiceResult, route: str) -> str:
+    """路線名またはroute_idをroute_idへ変換する。"""
+    routes = service.route_summary
+    route = str(route)
+    by_id = routes.loc[routes["route_id"].astype(str) == route]
+    by_name = routes.loc[routes["路線名"] == route]
+    selected = by_id if len(by_id) else by_name
+    if selected.empty:
+        choices = "、".join(routes["路線名"].dropna().astype(str))
+        raise ValueError(f"路線が見つかりません。次から選んでください：{choices}")
+    return str(selected.iloc[0]["route_id"])
+
+
+def _named_active_stop_times(
+    workshop: Workshop, service: ServiceResult
+) -> pd.DataFrame:
+    """指定日のstop_timesに停留所名・座標・路線名を付ける。"""
+    return (
+        service.active_stop_times.merge(
+            workshop.gtfs["stops"][
+                ["stop_id", "stop_name", "stop_lat", "stop_lon"]
+            ],
+            on="stop_id",
+            how="left",
+        )
+        .merge(
+            workshop.gtfs["routes"][
+                ["route_id", "route_long_name", "route_color"]
+            ],
+            on="route_id",
+            how="left",
+        )
+    )
+
+
+def show_stop_hour_heatmap(
+    workshop: Workshop,
+    service: ServiceResult,
+    stop_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """主要停留所について、時間帯別の停車回数をヒートマップで示す。"""
+    active = _named_active_stop_times(workshop, service).dropna(
+        subset=["arrival_sec", "stop_name"]
+    )
+    active["hour"] = (active["arrival_sec"] // 3600).astype(int)
+
+    if stop_names is None:
+        candidates = [
+            "豊岡駅",
+            "市役所前",
+            "芸術文化観光専門職大学",
+            "総合健康ゾーン（ウェルストーク豊岡）",
+            "コープデイズ前",
+            "長寿園前",
+            "バザールタウン豊岡メガ・フレッシュ館前",
+            "フレッシュバザール豊岡九日市店前",
+        ]
+        available = set(active["stop_name"])
+        stop_names = [name for name in candidates if name in available]
+        busiest = active["stop_name"].value_counts().index.tolist()
+        stop_names += [name for name in busiest if name not in stop_names][
+            : max(0, 10 - len(stop_names))
+        ]
+    else:
+        stop_names = [name for name in stop_names if name in set(active["stop_name"])]
+
+    if not stop_names:
+        raise ValueError("表示できる停留所がありません。停留所名を確認してください。")
+
+    first_hour = int(active["hour"].min())
+    last_hour = int(active["hour"].max())
+    hours = list(range(first_hour, last_hour + 1))
+    table = pd.crosstab(active["stop_name"], active["hour"]).reindex(
+        index=stop_names, columns=hours, fill_value=0
+    )
+
+    fig_height = max(4.8, 0.52 * len(stop_names))
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    image = ax.imshow(table.to_numpy(), cmap="YlOrRd", aspect="auto", vmin=0)
+    ax.set_xticks(range(len(hours)), [f"{hour}時" for hour in hours])
+    ax.set_yticks(range(len(stop_names)), stop_names)
+    ax.set_xlabel("時間帯")
+    ax.set_title(f"主要停留所の時間帯別停車回数（{service.date.date()}）")
+    for row in range(len(stop_names)):
+        for col in range(len(hours)):
+            value = int(table.iloc[row, col])
+            if value:
+                ax.text(
+                    col,
+                    row,
+                    str(value),
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if value >= max(2, table.to_numpy().max() * 0.55) else "#222222",
+                )
+    colorbar = fig.colorbar(image, ax=ax, pad=0.02)
+    colorbar.set_label("停車回数")
+    plt.tight_layout()
+    plt.show()
+    return table
+
+
+def show_time_space_diagram(
+    workshop: Workshop,
+    service: ServiceResult,
+    route: str = "コバス北ルート",
+) -> None:
+    """横軸を時刻、縦軸を停留所順序とする運行図を描く。"""
+    route_id = _route_id_from_name(service, route)
+    route_row = service.route_summary.loc[
+        service.route_summary["route_id"].astype(str) == route_id
+    ].iloc[0]
+    route_name = route_row["路線名"]
+    color = "#" + (
+        route_row["route_color"] if pd.notna(route_row["route_color"]) else "3388cc"
+    )
+    active = _named_active_stop_times(workshop, service)
+    active = active.loc[active["route_id"].astype(str) == route_id].copy()
+    if active.empty:
+        raise ValueError(f"{route_name}は指定日に運行していません。")
+
+    trip_sizes = active.groupby("trip_id").size()
+    representative_id = trip_sizes.idxmax()
+    representative = active.loc[active["trip_id"] == representative_id].sort_values(
+        "stop_sequence"
+    )
+    max_sequence = int(representative["stop_sequence"].max())
+
+    fig_height = max(6.2, min(10.0, max_sequence * 0.24))
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    for _, group in active.groupby("trip_id"):
+        ordered = group.sort_values("stop_sequence").dropna(subset=["arrival_sec"])
+        ax.plot(
+            ordered["arrival_sec"] / 3600,
+            ordered["stop_sequence"],
+            color=color,
+            linewidth=1.8,
+            alpha=0.78,
+        )
+        first = ordered.iloc[0]
+        ax.text(
+            first["arrival_sec"] / 3600,
+            first["stop_sequence"] - 0.35,
+            first["arrival_time"][:5],
+            fontsize=7,
+            color=color,
+            ha="center",
+        )
+
+    key_stops = {
+        "豊岡駅",
+        "市役所前",
+        "芸術文化観光専門職大学",
+        "総合健康ゾーン（ウェルストーク豊岡）",
+    }
+    tick_rows = representative.loc[
+        (representative["stop_sequence"] == 1)
+        | (representative["stop_sequence"] == max_sequence)
+        | (representative["stop_sequence"] % 3 == 0)
+        | representative["stop_name"].isin(key_stops)
+    ].drop_duplicates("stop_sequence")
+    ax.set_yticks(tick_rows["stop_sequence"], tick_rows["stop_name"])
+    start_hour = int(np.floor(active["arrival_sec"].min() / 3600))
+    end_hour = int(np.ceil(active["arrival_sec"].max() / 3600))
+    ax.set_xticks(range(start_hour, end_hour + 1), [f"{h}:00" for h in range(start_hour, end_hour + 1)])
+    ax.set_xlim(start_hour - 0.05, end_hour + 0.05)
+    ax.set_ylim(0.4, max_sequence + 0.6)
+    ax.set_xlabel("時刻")
+    ax.set_ylabel("停留所の順序")
+    ax.set_title(f"{route_name}の時空間ダイヤ（{service.date.date()}）")
+    ax.grid(alpha=0.22)
+    plt.tight_layout()
+    plt.show()
+
+
 def _base_map(center):
     result = folium.Map(location=center, zoom_start=14, tiles=None)
     folium.TileLayer(
@@ -364,6 +561,188 @@ def make_gtfs_map(workshop: Workshop, service: ServiceResult):
             fill_opacity=1,
             tooltip=row.stop_name,
         ).add_to(result)
+    return result
+
+
+def make_reachable_map(
+    workshop: Workshop,
+    service: ServiceResult,
+    origin: str = "豊岡駅",
+    departure: str = "09:00",
+    max_minutes: int = 60,
+):
+    """指定時刻以降に乗車し、乗換なしで到達できる停留所を示す。"""
+    try:
+        hour, minute = map(int, departure.split(":")[:2])
+        start_sec = hour * 3600 + minute * 60
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("出発時刻は '09:00' のように入力してください。") from exc
+
+    active = _named_active_stop_times(workshop, service).dropna(
+        subset=["arrival_sec", "departure_sec", "stop_name"]
+    )
+    origins = active.loc[
+        (active["stop_name"] == origin) & (active["departure_sec"] >= start_sec)
+    ].sort_values("departure_sec")
+    if origins.empty:
+        choices = "、".join(sorted(active["stop_name"].dropna().unique()))
+        raise ValueError(
+            f"{departure}以降に「{origin}」を出発する便がありません。"
+            f"停留所名の候補：{choices}"
+        )
+
+    limit_sec = start_sec + int(max_minutes) * 60
+    rows = []
+    for origin_row in origins.itertuples():
+        downstream = active.loc[
+            (active["trip_id"] == origin_row.trip_id)
+            & (active["stop_sequence"] >= origin_row.stop_sequence)
+            & (active["arrival_sec"] <= limit_sec)
+        ]
+        for row in downstream.itertuples():
+            rows.append(
+                {
+                    "stop_name": row.stop_name,
+                    "arrival_sec": row.arrival_sec,
+                    "route_long_name": row.route_long_name,
+                    "stop_lat": row.stop_lat,
+                    "stop_lon": row.stop_lon,
+                }
+            )
+    if not rows:
+        raise ValueError(f"{max_minutes}分以内に到達できる停留所がありません。")
+
+    reachable = (
+        pd.DataFrame(rows)
+        .sort_values("arrival_sec")
+        .drop_duplicates("stop_name")
+        .copy()
+    )
+    reachable["経過分"] = ((reachable["arrival_sec"] - start_sec) / 60).round().astype(int)
+    reachable["到着時刻"] = reachable["arrival_sec"].map(
+        lambda sec: f"{int(sec // 3600):02d}:{int((sec % 3600) // 60):02d}"
+    )
+
+    stops = workshop.gtfs["stops"]
+    origin_rows = stops.loc[stops["stop_name"] == origin]
+    center = (
+        [origin_rows["stop_lat"].mean(), origin_rows["stop_lon"].mean()]
+        if len(origin_rows)
+        else [stops["stop_lat"].mean(), stops["stop_lon"].mean()]
+    )
+    result = _base_map(center)
+    _add_routes(result, service.route_lines)
+    color_map = linear.YlGnBu_09.scale(0, max_minutes)
+    color_map.caption = f"{departure}からの経過時間（分、乗換なし）"
+    for row in reachable.itertuples():
+        color = color_map(min(max_minutes, row.経過分))
+        folium.CircleMarker(
+            [row.stop_lat, row.stop_lon],
+            radius=7,
+            color="#333333",
+            weight=1,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.9,
+            tooltip=f"{row.stop_name}：{row.到着時刻}",
+            popup=folium.Popup(
+                f"<b>{row.stop_name}</b><br>最早到着：{row.到着時刻}<br>"
+                f"出発時刻から：{row.経過分}分<br>路線：{row.route_long_name}",
+                max_width=320,
+            ),
+        ).add_to(result)
+    if len(origin_rows):
+        folium.Marker(
+            center,
+            tooltip=f"出発地：{origin}",
+            popup=f"{origin}を{departure}に出発すると仮定",
+            icon=folium.Icon(color="red", icon="play"),
+        ).add_to(result)
+    color_map.add_to(result)
+    folium.LayerControl(collapsed=False).add_to(result)
+    print(
+        f"{origin}を{departure}に出発：乗換なし・{max_minutes}分以内に"
+        f"{len(reachable)}停留所へ到達可能"
+    )
+    return result
+
+
+def make_schedule_animation(
+    workshop: Workshop,
+    service: ServiceResult,
+    step_minutes: int = 2,
+):
+    """GTFS時刻表から推定したバスの予定位置を時間スライダーで示す。"""
+    if step_minutes < 1:
+        raise ValueError("step_minutesは1以上にしてください。")
+    active = _named_active_stop_times(workshop, service).dropna(
+        subset=["arrival_sec", "stop_lat", "stop_lon"]
+    )
+    features = []
+    step_seconds = int(step_minutes) * 60
+    for trip_id, group in active.groupby("trip_id"):
+        ordered = (
+            group.sort_values(["arrival_sec", "stop_sequence"])
+            .drop_duplicates("arrival_sec", keep="last")
+        )
+        if len(ordered) < 2:
+            continue
+        seconds = ordered["arrival_sec"].to_numpy(dtype=float)
+        samples = np.arange(
+            np.ceil(seconds.min() / step_seconds) * step_seconds,
+            seconds.max() + 1,
+            step_seconds,
+        )
+        samples = np.unique(np.r_[seconds.min(), samples, seconds.max()])
+        lons = np.interp(samples, seconds, ordered["stop_lon"].to_numpy(dtype=float))
+        lats = np.interp(samples, seconds, ordered["stop_lat"].to_numpy(dtype=float))
+        route_name = str(ordered.iloc[0]["route_long_name"])
+        route_color = ordered.iloc[0]["route_color"]
+        color = "#" + (route_color if pd.notna(route_color) else "3388cc")
+        for second, lon, lat in zip(samples, lons, lats):
+            timestamp = service.date.normalize() + pd.to_timedelta(second, unit="s")
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    "properties": {
+                        "time": timestamp.isoformat(),
+                        "popup": f"{route_name}<br>{timestamp.strftime('%H:%M')}",
+                        "tooltip": route_name,
+                        "icon": "circle",
+                        "iconstyle": {
+                            "fillColor": color,
+                            "fillOpacity": 0.95,
+                            "stroke": True,
+                            "radius": 6,
+                            "color": "#222222",
+                            "weight": 1,
+                        },
+                    },
+                }
+            )
+
+    stops = workshop.gtfs["stops"]
+    result = _base_map([stops["stop_lat"].mean(), stops["stop_lon"].mean()])
+    _add_routes(result, service.route_lines)
+    TimestampedGeoJson(
+        {"type": "FeatureCollection", "features": features},
+        period=f"PT{step_minutes}M",
+        duration=f"PT{step_minutes}M",
+        add_last_point=False,
+        auto_play=False,
+        loop=False,
+        loop_button=True,
+        max_speed=8,
+        date_options="HH:mm",
+        time_slider_drag_update=True,
+    ).add_to(result)
+    warning = (
+        "<div style='position:fixed;top:10px;left:50px;z-index:9999;"
+        "background:white;padding:7px 10px;border:1px solid #777;font-size:12px'>"
+        "GTFS時刻表から推定した予定位置（実車位置ではありません）</div>"
+    )
+    result.get_root().html.add_child(folium.Element(warning))
     return result
 
 
@@ -555,6 +934,70 @@ def make_access_map(
             ),
         ).add_to(stop_layer)
     stop_layer.add_to(result)
+    folium.LayerControl(collapsed=False).add_to(result)
+    return result
+
+
+def make_service_review_map(
+    workshop: Workshop,
+    service: ServiceResult,
+    access: AccessResult,
+):
+    """近隣人口と停車回数の組合せを4分類して地図に示す。"""
+    distance = access.distance_m
+    table = access.stop_access.copy()
+    population_col = f"{distance}m圏人口"
+    population_median = float(table[population_col].median())
+    calls_median = float(table["停車回数"].median())
+
+    def classify(row):
+        high_population = row[population_col] >= population_median
+        high_service = row["停車回数"] >= calls_median
+        if high_population and not high_service:
+            return "人口多・便少（要確認）", "#d73027"
+        if high_population and high_service:
+            return "人口多・便多", "#1a9850"
+        if not high_population and high_service:
+            return "人口少・便多", "#4575b4"
+        return "人口少・便少", "#bdbdbd"
+
+    classifications = table.apply(classify, axis=1)
+    table["分類"] = [item[0] for item in classifications]
+    table["色"] = [item[1] for item in classifications]
+
+    stops = workshop.gtfs["stops"]
+    result = _base_map([stops["stop_lat"].mean(), stops["stop_lon"].mean()])
+    _add_routes(result, service.route_lines)
+    for _, row in table.iterrows():
+        folium.CircleMarker(
+            [row.geometry.y, row.geometry.x],
+            radius=8,
+            color="#333333",
+            weight=1,
+            fill=True,
+            fill_color=row["色"],
+            fill_opacity=0.9,
+            tooltip=f"{row['停留所名']}：{row['分類']}",
+            popup=folium.Popup(
+                f"<b>{row['停留所名']}</b><br>{row['分類']}<br>"
+                f"停車回数：{row['停車回数']}回<br>"
+                f"{distance}m圏人口：{row[population_col]:,.0f}人",
+                max_width=320,
+            ),
+        ).add_to(result)
+
+    legend = """
+    <div style="position:fixed;bottom:30px;left:40px;z-index:9999;
+      background:white;padding:9px 12px;border:1px solid #777;font-size:12px">
+      <b>近隣人口 × 停車回数</b><br>
+      <span style="color:#d73027">●</span> 人口多・便少（要確認）<br>
+      <span style="color:#1a9850">●</span> 人口多・便多<br>
+      <span style="color:#4575b4">●</span> 人口少・便多<br>
+      <span style="color:#bdbdbd">●</span> 人口少・便少<br>
+      ※中央値による探索的な分類
+    </div>
+    """
+    result.get_root().html.add_child(folium.Element(legend))
     folium.LayerControl(collapsed=False).add_to(result)
     return result
 
