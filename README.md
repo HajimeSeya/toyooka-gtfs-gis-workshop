@@ -16,7 +16,7 @@ GISやPythonの経験がなくても、上から順番にセルを実行すれ�
 
 Googleアカウントでログインした状態で、下のボタンからGoogle Colabを開いてください。
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HajimeSeya/toyooka-gtfs-gis-workshop/blob/main/oji_tarumi_public_transport_gis_workshop_v23_distribution_final.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HajimeSeya/toyooka-gtfs-gis-workshop/blob/main/saiseijyuku2026.ipynb)
 
 > **必要なもの**
 >
